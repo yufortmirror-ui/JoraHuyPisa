@@ -230,6 +230,7 @@ def get_days_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Сб", callback_data="day_сб")
     )
     builder.row(InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="bells"))
+    builder.row(InlineKeyboardButton(text="🔄 Сменить группу", callback_data="change_group"))  # ← новая кнопка
     builder.row(InlineKeyboardButton(text="💰 Поддержать автора", callback_data="support"))
     return builder.as_markup()
 
