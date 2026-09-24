@@ -5,6 +5,8 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+
+import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,6 +19,7 @@ BOT_TOKEN = "123123"
 CHECK_INTERVAL_SECONDS = 5 * 60 * 60  # 5 часов
 BASE_URL = "https://xn--c1aexnm.xn--p1ai"
 GROUPS_PER_PAGE = 6  # Количество групп на одной странице кнопок
+DB_PATH = "users.db"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,11 +27,60 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилища
+# --- Хранилища ---
 user_states: Dict[int, str] = {}
 user_groups: Dict[int, str] = {}
 user_pages: Dict[int, int] = {}  # {chat_id: current_page}
 
+# --- БАЗА ДАННЫХ ---
+async def init_db():
+    """Создаёт таблицу пользователей при первом запуске."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                registered_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+
+async def save_user(user: types.User):
+    """Сохраняет пользователя в БД, если его там ещё нет."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user.id,)
+        )
+        if await cursor.fetchone() is None:
+            await db.execute(
+                "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+                (user.id, user.username, user.first_name)
+            )
+            await db.commit()
+            logger.info(f"Новый пользователь сохранён: {user.id} ({user.first_name})")
+
+
+async def get_users_count() -> int:
+    """Возвращает количество зарегистрированных пользователей."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_all_users() -> list:
+    """Возвращает список всех пользователей."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, username, first_name, registered_at FROM users"
+        )
+        return await cursor.fetchall()
+
+
+# --- СПИСКИ ---
 # Полный список всех групп университета
 ALL_GROUPS = [
     # 1 курс (26-27)
@@ -47,28 +99,19 @@ WEEKDAYS = ["понедельник", "вторник", "среда", "четв�
 WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 SCHEDULE_BELLS = """<b>Расписание звонков</b>
-
 1 пара — с 8:00 до 9:30
-
 2 пара — с 9:40 до 11:10
-
 Обеденный перерыв — 20 минут
-
 3 пара — с 11:30 до 13:00
-
 Обеденный перерыв — 20 минут
-
 4 пара — с 13:20 до 14:50
-
 5 пара — с 15:00 до 16:30
-
 6 пара — с 16:40 до 18:10
-
 7 пара — с 18:20 до 19:50
-
 8 пара — с 20:00 до 21:30"""
 
 
+# --- УТИЛИТЫ ---
 def get_target_date(day_type: str) -> datetime:
     today = datetime.now()
     if day_type == "today":
@@ -128,7 +171,6 @@ def parse_schedule_from_html(html: str, target_date: Optional[datetime] = None) 
         return f"📅 {date_str}, {weekday}\n\n✅ Пар нет."
 
     pair_num = 0
-
     for row in rows:
         # Пропускаем служебные строки
         if 'empty-row' in row.get('class', []) or row.find('div', class_='window-slot'):
@@ -137,8 +179,8 @@ def parse_schedule_from_html(html: str, target_date: Optional[datetime] = None) 
         subject_cell = row.find('td', class_='subject-cell')
         if not time_cell or not subject_cell:
             continue
-        time_text = time_cell.get_text(strip=True)
 
+        time_text = time_cell.get_text(strip=True)
         single_class = subject_cell.find('div', class_='single-class')
         subgroup_container = subject_cell.find('div', class_='subgroup-container')
 
@@ -182,18 +224,16 @@ def parse_schedule_from_html(html: str, target_date: Optional[datetime] = None) 
                     result += format_pair_text(span.get_text(strip=True), " (подгр.)")
 
     if pair_num == 0:
-        return f" {date_str}, {weekday}\n\n✅ Пар нет."
+        return f"{date_str}, {weekday}\n\n✅ Пар нет."
 
     return result[:4000]
 
 
 # --- КЛАВИАТУРЫ ---
-
 def get_group_selection_keyboard(page: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     total_pages = max(1, (len(ALL_GROUPS) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
     page = min(max(0, page), total_pages - 1)
-
     start_idx = page * GROUPS_PER_PAGE
     end_idx = min(start_idx + GROUPS_PER_PAGE, len(ALL_GROUPS))
 
@@ -230,7 +270,7 @@ def get_days_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Сб", callback_data="day_сб")
     )
     builder.row(InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="bells"))
-    builder.row(InlineKeyboardButton(text="🔄 Сменить группу", callback_data="change_group"))  # ← новая кнопка
+    builder.row(InlineKeyboardButton(text="🔄 Сменить группу", callback_data="change_group"))
     builder.row(InlineKeyboardButton(text="💰 Поддержать автора", callback_data="support"))
     return builder.as_markup()
 
@@ -242,14 +282,12 @@ def generate_hash(content: str) -> str:
 async def send_schedule_for_day(chat_id: int, group: str, day_type: str):
     html = await get_schedule_html(group)
     schedule_text = parse_schedule_from_html(html, get_target_date(day_type))
-
     labels = {
         "today": "Сегодня", "tomorrow": "Завтра",
         "пн": "Пн", "вт": "Вт", "ср": "Ср",
         "чт": "Чт", "пт": "Пт", "сб": "Сб"
     }
     day_label = labels.get(day_type, day_type)
-
     await bot.send_message(
         chat_id,
         f"<b>{group}</b> ({day_label}):\n\n{schedule_text}",
@@ -259,14 +297,23 @@ async def send_schedule_for_day(chat_id: int, group: str, day_type: str):
 
 
 # --- ОБРАБОТЧИКИ ---
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    # Сохраняем нового пользователя в БД
+    await save_user(message.from_user)
+
     user_pages[message.from_user.id] = 0
     await message.answer(
         "Привет! Выберите свою группу:",
         reply_markup=get_group_selection_keyboard(0)
     )
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: types.Message):
+    """Админ-команда для просмотра количества пользователей."""
+    count = await get_users_count()
+    await message.answer(f"👥 Всего зарегистрировано пользователей: <b>{count}</b>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("page_"))
@@ -281,10 +328,8 @@ async def paginate_callback(callback: types.CallbackQuery):
 async def select_group_callback(callback: types.CallbackQuery):
     group = callback.data.replace("group_", "")
     user_groups[callback.from_user.id] = group
-
     await callback.message.edit_text(f"✅ Выбрана группа: <b>{group}</b>", parse_mode="HTML")
     await send_schedule_for_day(callback.from_user.id, group, "today")
-
     html = await get_schedule_html(group)
     if html:
         user_states[callback.from_user.id] = generate_hash(parse_schedule_from_html(html))
@@ -345,7 +390,6 @@ async def view_changes_callback(callback: types.CallbackQuery):
 
 
 # --- ФОНОВАЯ ПРОВЕРКА ---
-
 async def check_updates_background():
     logger.info("Background checker started.")
     while True:
@@ -361,6 +405,7 @@ async def check_updates_background():
                     continue
                 content = parse_schedule_from_html(html)
                 processed[group] = generate_hash(content)
+
             new_hash = processed[group]
             if new_hash != old_hash:
                 kb = InlineKeyboardBuilder().button(
@@ -378,7 +423,9 @@ async def check_updates_background():
                     logger.error(f"Notify failed for {chat_id}: {e}")
 
 
+# --- ЗАПУСК ---
 async def main():
+    await init_db()  # Инициализация БД перед стартом
     asyncio.create_task(check_updates_background())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
